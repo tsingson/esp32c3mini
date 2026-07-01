@@ -108,6 +108,16 @@ static void worker_task(void* arg)
     }
 }
 
+void init_boot_pin(void) {
+  gpio_config_t io_conf = {
+      .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_ENABLE, // 正常运行时依靠内部上拉维持绝对高电平
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_NEGEDGE // 锁定下降沿事件
+  };
+  gpio_config(&io_conf);
+}
 void app_main(void)
 {
     // A. 开头强制等待 3 秒。非常核心，留足时间给电脑的串口监视器自动重新识别 USB-CDC。
@@ -164,14 +174,7 @@ void app_main(void)
     xTaskCreate(worker_task, "worker_task", 3072, NULL, 5, NULL);
 
     // E. 重新拉起并初始化 BOOT 键的外围数字控制层
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,     // 正常运行时依靠内部上拉维持绝对高电平
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE       // 锁定下降沿事件
-    };
-    gpio_config(&io_conf);
+    init_boot_pin();
 
     // 正式激活外部 GPIO 中断路由服务并绑定对应的处理句柄
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
