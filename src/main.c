@@ -12,10 +12,10 @@
 
 // 需求：3 分钟定时自动唤醒 (3分钟 * 60秒 * 1,000,000微秒)
 // 💡 提示：测试阶段强烈建议将其改为 (5ULL * 1000ULL * 1000ULL) 也就是 5 秒，以便极速验证连续多轮循环
-#define SLEEP_DURATION_US (3ULL * 60ULL * 1000ULL * 1000ULL)
+#define SLEEP_DURATION_US (1ULL * 60ULL * 1000ULL * 1000ULL)
 
 // 需求 2：Worker 任务的超时时间为 30 秒
-#define WORKER_TIMEOUT_MS (30 * 1000)
+#define WORKER_TIMEOUT_MS (10 * 1000)
 
 static const char *TAG = "BOOT_NVS_DEMO";
 static TaskHandle_t sleep_task_handle = NULL;
@@ -88,10 +88,10 @@ static void nvs_and_sleep_task(void* arg)
 static void worker_task(void* arg)
 {
     uint32_t elapsed_ms = 0;
-    const uint32_t interval_ms = 3000; // 每 3 秒执行一次打印动作
+    const uint32_t interval_ms = 1000; // 每 3 秒执行一次打印动作
 
     ESP_LOGI("WORKER", "Worker 任务已就绪，正在开启 30 秒生命生存倒计时...");
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(100));
     while (1) {
         // 需求 1：这个 worker task 只做一个简单的任务, 那就是 打印自增序号
         ESP_LOGI("WORKER", "【工作正常】持久化序号 = %ld (当前运行进度: %ld / 30 秒)", boot_isr_seq, elapsed_ms / 1000);
@@ -101,7 +101,7 @@ static void worker_task(void* arg)
         elapsed_ms += interval_ms;
 
         // 需求 2：worker task 超过30秒时, 则调用 deep sleep 函数
-        if (elapsed_ms >= WORKER_TIMEOUT_MS) {
+        if (elapsed_ms >= WORKER_TIMEOUT_MS  ) {
             // 触发结局 B 流程
             save_sequence_and_enter_deep_sleep("【分叉 结局 B: 满 30 秒超时】");
         }
