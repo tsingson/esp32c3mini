@@ -1,0 +1,34 @@
+# Binaries for programs and plugins
+node_modules/
+version.txt
+*.dll
+*.so
+*.dylib
+cmd/bin/
+.idea/*
+*/.idea/*
+*/packages
+packages/
+packages/*
+.pio/
+.pio/*
+*/.pio/*
+*/.idea
+.idea/
+cmd/bin/
+**/linux-bin/
+cmd/bin/*
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
+.glide/
+**/testdata/
+
+
+.DS_Store
+
+*.rdb
