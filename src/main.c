@@ -91,7 +91,7 @@ static void worker_task(void* arg)
     const uint32_t interval_ms = 3000; // 每 3 秒执行一次打印动作
 
     ESP_LOGI("WORKER", "Worker 任务已就绪，正在开启 30 秒生命生存倒计时...");
-
+    vTaskDelay(pdMS_TO_TICKS(200));
     while (1) {
         // 需求 1：这个 worker task 只做一个简单的任务, 那就是 打印自增序号
         ESP_LOGI("WORKER", "【工作正常】持久化序号 = %ld (当前运行进度: %ld / 30 秒)", boot_isr_seq, elapsed_ms / 1000);
@@ -147,11 +147,13 @@ void app_main(void)
         ESP_LOGE(TAG, "【⏰ 时间自动唤醒成功】休眠阶段圆满结束！");
         ESP_LOGE(TAG, "成功从非易失 Flash 中加载到最新的序号：%ld", boot_isr_seq);
         ESP_LOGE(TAG, "==================================================");
+        vTaskDelay(pdMS_TO_TICKS(200));
     } else {
         ESP_LOGI(TAG, "==================================================");
         ESP_LOGI(TAG, "【🔌 物理冷上电 / RST 键手动复位成功】");
         ESP_LOGI(TAG, "当前从持久化闪存中安全加载的序号为: %ld", boot_isr_seq);
         ESP_LOGI(TAG, "==================================================");
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
     printf("\n");
 
