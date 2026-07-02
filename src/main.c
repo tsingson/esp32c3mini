@@ -121,7 +121,7 @@ void init_boot_pin(void) {
 void app_main(void)
 {
     // A. 开头强制等待 3 秒。非常核心，留足时间给电脑的串口监视器自动重新识别 USB-CDC。
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     // B. 安全初始化非易失存储闪存库
     esp_err_t ret = nvs_flash_init();
