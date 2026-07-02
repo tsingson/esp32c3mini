@@ -116,7 +116,7 @@ static void worker_task(void *arg) {
   }
 }
 
-void init_boot_pin(void) {
+esp_err_t init_boot_pin(void) {
   gpio_config_t io_conf = {
       .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
       .mode = GPIO_MODE_INPUT,
@@ -124,8 +124,9 @@ void init_boot_pin(void) {
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_NEGEDGE // 锁定下降沿事件
   };
-  gpio_config(&io_conf);
+  ESP_ERROR_CHECK(gpio_config(&io_conf));
 }
+
 void app_main(void) {
   // A. 开头强制等待 3 秒。非常核心，留足时间给电脑的串口监视器自动重新识别
   // USB-CDC。
