@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -9,7 +8,6 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_http_client.h"
-#include "esp_sleep.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_vfs_dev.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -21,7 +19,10 @@ static const char *TAG = "SAR_PROTOTYPE";
 #define CMD_WRITE_SSID 0x11
 #define CMD_WRITE_PASS 0x12
 
-// 规格锁定定义
+// 🎯 需求变更：硬编码默认硬后备网络配置信息
+#define DEFAULT_WIFI_SSID "MUSIC"
+#define DEFAULT_WIFI_PASS "22676263"
+
 char wifi_ssid[32] = {0};
 char wifi_pass[64] = {0};
 
@@ -31,12 +32,10 @@ char temp_pass[64] = {0};
 int temp_pass_idx = 0;
 
 uint8_t httpd_enable = 0;
-
-// 虚拟串口状态标志位
 volatile bool g_usb_driver_installed = false;
 
 /* ------------------------------------------------------------------
- * 1. NVS 持久化存储与加载逻辑
+ * 1. NVS 持久化存储与加载逻辑 (支持出厂默认注入)
  * ------------------------------------------------------------------ */
 void init_and_load_nvs_config(void) {
     esp_err_t err = nvs_flash_init();
@@ -55,14 +54,19 @@ void init_and_load_nvs_config(void) {
             nvs_commit(my_handle);
         }
 
+        // 🎯 需求变更：如果 Flash 为空读取不到 SSID，直接注入并持久化默认账密
         size_t size = sizeof(wifi_ssid);
         if (nvs_get_str(my_handle, "ssid", wifi_ssid, &size) != ESP_OK) {
-            strcpy(wifi_ssid, "未设置SSID");
+            strcpy(wifi_ssid, DEFAULT_WIFI_SSID);
+            nvs_set_str(my_handle, "ssid", wifi_ssid);
+            nvs_commit(my_handle);
         }
 
         size = sizeof(wifi_pass);
         if (nvs_get_str(my_handle, "pass", wifi_pass, &size) != ESP_OK) {
-            strcpy(wifi_pass, "");
+            strcpy(wifi_pass, DEFAULT_WIFI_PASS);
+            nvs_set_str(my_handle, "pass", wifi_pass);
+            nvs_commit(my_handle);
         }
 
         nvs_close(my_handle);
@@ -89,7 +93,7 @@ void send_packet(uint8_t cmd, uint8_t status, uint8_t val) {
 }
 
 /* ------------------------------------------------------------------
- * 2. Wi-Fi 连接与 HTTP 请求 (httpbin.org)
+ * 2. Wi-Fi 连接与 HTTP 请求 (支持自愈降级动态覆盖)
  * ------------------------------------------------------------------ */
 static bool wifi_connected = false;
 
@@ -103,21 +107,25 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-bool init_wifi_and_connect(void) {
-    if (strcmp(wifi_ssid, "未设置SSID") == 0 || strlen(wifi_ssid) == 0) {
+// 接收传入参数，支持传入自定义配置或硬编码默认配置
+bool init_wifi_and_connect(const char* target_ssid, const char* target_pass) {
+    if (strlen(target_ssid) == 0) {
         return false;
     }
 
     wifi_config_t wifi_config = {0};
-    strncpy((char*)wifi_config.sta.ssid, wifi_ssid, sizeof(wifi_config.sta.ssid));
-    strncpy((char*)wifi_config.sta.password, wifi_pass, sizeof(wifi_config.sta.password));
+    strncpy((char*)wifi_config.sta.ssid, target_ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, target_pass, sizeof(wifi_config.sta.password));
 
+    // 强行命令 Wi-Fi 驱动使用 RAM 配置，忽略并覆盖过往隐藏的乱连历史
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
     wifi_connected = false;
     if (esp_wifi_start() != ESP_OK) return false;
 
+    // 有限阻塞等待 10 秒
     int retry = 0;
     while (!wifi_connected && retry < 20) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -156,56 +164,58 @@ bool fetch_httpbin(void) {
 }
 
 /* ------------------------------------------------------------------
- * 3. 搜救主业务任务循环 (低功耗彻底断连与自愈优化)
+ * 3. 搜救主业务任务循环 (支持异常自动降级自愈)
  * ------------------------------------------------------------------ */
 void sar_mission_task(void *pvParameters) {
     ESP_ERROR_CHECK(esp_netif_init());
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     while (1) {
         int retry_count = 0;
+        bool bidi_transmission_success = false;
 
-        if (g_usb_driver_installed) {
-            ESP_LOGI(TAG, "开始执行搜救网络状态上报任务...");
-        }
-
-        if (init_wifi_and_connect()) {
+        // 🚀 尝试 1：优先采用 Flash 存储的用户网络账密进行连接上报
+        if (init_wifi_and_connect(wifi_ssid, wifi_pass)) {
             while (retry_count < 3) {
                 if (fetch_httpbin()) {
+                    bidi_transmission_success = true;
                     break;
                 }
                 retry_count++;
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
+            stop_wifi();
         }
 
-        stop_wifi();
+        // 🚀 尝试 2（🎯 降级核心）：如果上面因为连接超时或访问 httpbin 失败 3 次
+        if (!bidi_transmission_success) {
+            if (g_usb_driver_installed) {
+                printf("\n⚠️ [自愈警告] 用户配置连接失败，强制降级使用默认安全网络线路: %s ...\n", DEFAULT_WIFI_SSID);
+            }
 
-        // 卸载驱动，让 USB PHY 物理层完全断电断开
-        if (g_usb_driver_installed) {
-            fflush(stdout);
-            fsync(fileno(stdout));
-            vTaskDelay(pdMS_TO_TICKS(50));
-            usb_serial_jtag_driver_uninstall();
-            g_usb_driver_installed = false;
+            // 强制启用硬编码后备账密进行兜底连接
+            if (init_wifi_and_connect(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS)) {
+                retry_count = 0;
+                while (retry_count < 3) {
+                    if (fetch_httpbin()) {
+                        break;
+                    }
+                    retry_count++;
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
+                stop_wifi();
+            }
         }
 
-        esp_sleep_enable_timer_wakeup(3 * 60 * 1000000ULL);
-        esp_light_sleep_start();
-
-        // --- ⏳ 3 分钟后，硬件自动从此处苏醒 ⏳ ---
-
-        usb_serial_jtag_driver_config_t usb_config = { .rx_buffer_size = 512, .tx_buffer_size = 512 };
-        if (usb_serial_jtag_driver_install(&usb_config) == ESP_OK) {
-            usb_serial_jtag_vfs_use_driver();
-            g_usb_driver_installed = true;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // 完成本周期上报后，纯软件挂起 3 分钟进行下一次轮询
+        vTaskDelay(pdMS_TO_TICKS(3 * 60 * 1000));
     }
 }
 
@@ -217,11 +227,6 @@ void usb_rx_task(void *pvParameters) {
     int packet_idx = 0;
 
     while (1) {
-        if (!g_usb_driver_installed) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
         uint8_t ch;
         int len = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(10));
         if (len > 0) {
@@ -273,23 +278,18 @@ void usb_rx_task(void *pvParameters) {
     }
 }
 
-/* ------------------------------------------------------------------
- * 5. 系统核心初始化入口 (大括号完全闭合并锁定)
- * ------------------------------------------------------------------ */
 void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     init_and_load_nvs_config();
 
-    // 上电首次建立驱动回路
     usb_serial_jtag_driver_config_t usb_config = { .rx_buffer_size = 512, .tx_buffer_size = 512 };
     if (!g_usb_driver_installed) {
         ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_config));
         usb_serial_jtag_vfs_use_driver();
         g_usb_driver_installed = true;
     }
-
     xTaskCreate(usb_rx_task, "usb_rx_task", 3072, NULL, 10, NULL);
     xTaskCreate(sar_mission_task, "sar_mission", 5120, NULL, 5, NULL);
-} // <--- 🚀 语法锁死：app_main 完美闭合，决不再报 expected declaration 错误
+}
