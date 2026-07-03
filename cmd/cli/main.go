@@ -10,88 +10,132 @@ import (
 	"github.com/tarm/serial"
 )
 
- // sendAndReceive 显式利用 tarm/serial 进行二进制交互
- func sendAndReceive(portName string, cmd byte, val byte) (byte, error) {
- 	// 直连 tarm/serial 的配置实例
- 	config := &serial.Config{
- 		Name:        portName,
- 		Baud:        115200,
- 		ReadTimeout: time.Millisecond * 1200, // 设定 1.2 秒的安全读取超时
- 	}
 
- 	s, err := serial.OpenPort(config)
- 	if err != nil {
- 		return 0, fmt.Errorf("无法打开端口: %v", err)
- 	}
- 	defer s.Close()
 
- 	// 🚀 【关键】给内置虚拟 USB-Serial-JTAG 端口留出驱动级总线枚举锁定的时间，避免数据滑落
- 	time.Sleep(time.Millisecond * 1000)
-
- 	// 组装 5-byte 数据帧
+ // 发送单包命令并读取响应
+ func sendPacket(s *serial.Port, cmd, statusOrIdx, val byte) ([]byte, error) {
  	txBuf := make([]byte, 5)
  	txBuf[0] = 0xAA
  	txBuf[1] = 0xBB
  	txBuf[2] = cmd
- 	txBuf[3] = val
- 	txBuf[4] = txBuf[0] + txBuf[1] + cmd + val // 校验和计算
+ 	txBuf[3] = statusOrIdx
+ 	txBuf[4] = val
 
- 	// 强制清空硬件缓冲区残留
+ 	var sum byte
+ 	for i := 0; i < 4; i++ {
+ 		sum += txBuf[i]
+ 	}
+ 	txBuf[4] = sum
+
  	s.Flush()
-
- 	// 写入指令
- 	_, err = s.Write(txBuf)
+ 	_, err := s.Write(txBuf)
  	if err != nil {
- 		return 0, fmt.Errorf("写入错误: %v", err)
+ 		return nil, err
  	}
 
- 	// 强制使用 io.ReadFull 保证在 tarm/serial 缓冲区积攒足够 5 字节前绝不提前收流
+ 	// 阻塞读取 5 字节回执
  	rxBuf := make([]byte, 5)
  	_, err = io.ReadFull(s, rxBuf)
  	if err != nil {
- 		return 0, fmt.Errorf("读取完整回执失败或触发超时断开 (EOF): %v", err)
+ 		return nil, err
  	}
 
- 	// 包校验验证
+ 	// 基础校验
  	if rxBuf[0] != 0xAA || rxBuf[1] != 0xBB {
- 		return 0, fmt.Errorf("无效的回执帧头: [0x%X 0x%X]", rxBuf[0], rxBuf[1])
+ 		return nil, fmt.Errorf("无效帧头")
  	}
-
- 	calcSum := rxBuf[0] + rxBuf[1] + rxBuf[2] + rxBuf[3]
+ 	var calcSum byte
+ 	for i := 0; i < 4; i++ {
+ 		calcSum += rxBuf[i]
+ 	}
  	if rxBuf[4] != calcSum {
- 		return 0, fmt.Errorf("回执校验和错误: 期待 0x%X, 收到 0x%X", calcSum, rxBuf[4])
+ 		return nil, fmt.Errorf("校验和错误")
  	}
 
- 	return rxBuf[3], nil
+ 	return rxBuf, nil
+ }
+
+ // 流式读取模式
+ func streamRead(portName string) {
+ 	config := &serial.Config{Name: portName, Baud: 115200, ReadTimeout: time.Second * 2}
+ 	s, err := serial.OpenPort(config)
+ 	if err != nil {
+ 		log.Fatalf("无法打开串口: %v", err)
+ 	}
+ 	defer s.Close()
+
+ 	time.Sleep(time.Millisecond * 1000)
+ 	fmt.Println("[Go-Client] 发送流式读取激活指令...")
+
+ 	// 发送激活包: cmd=0x03, 后两字节填 0 即可
+ 	txBuf := []byte{0xAA, 0xBB, 0x03, 0x00, 0x00}
+ 	var sum byte
+ 	for i := 0; i < 4; i++ { sum += txBuf[i] }
+ 	txBuf[4] = sum
+ 	s.Write(txBuf)
+
+ 	fmt.Println("[Go-Client] 进入 Streaming 接收状态，等待数据喷吐...")
+
+ 	// 循环 16 次，每次严格等待接收 ESP32 每隔 0.5 秒发来的一包
+ 	for i := 0; i < 16; i++ {
+ 		rxBuf := make([]byte, 5)
+ 		_, err := io.ReadFull(s, rxBuf)
+ 		if err != nil {
+ 			log.Fatalf("\n❌ 流式读取中断: %v", err)
+ 		}
+
+ 		idx := rxBuf[3]
+ 		val := rxBuf[4]
+ 		fmt.Printf("⏱️ [0.5s 步进] 收到队列数据 -> 索引位置 [%02d]: 数值 = %d\n", idx, val)
+ 	}
+ 	fmt.Println("🎉 16位队列流式读取完整结束！")
+ }
+
+ // 流式写入模式
+ func streamWrite(portName string) {
+ 	config := &serial.Config{Name: portName, Baud: 115200, ReadTimeout: time.Second * 1}
+ 	s, err := serial.OpenPort(config)
+ 	if err != nil {
+ 		log.Fatalf("无法打开串口: %v", err)
+ 	}
+ 	defer s.Close()
+
+ 	time.Sleep(time.Millisecond * 1000)
+ 	fmt.Println("[Go-Client] 开始向模拟队列流式同步写入 16 个新数值...")
+
+ 	// 模拟要写入的 16 个新数据：100 到 115
+ 	newData := []byte{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115}
+
+ 	for idx, val := range newData {
+ 		// 每隔 0.5 秒向下级推送一包
+ 		fmt.Printf("📤 [0.5s 步进] 正在上报 -> 索引位置 [%02d] : 改写值 = %d\n", idx, val)
+
+ 		rx, err := sendPacket(s, 0x04, byte(idx), val)
+ 		if err != nil {
+ 			log.Fatalf("❌ 流式写入失败: %v", err)
+ 		}
+
+ 		if rx[4] != 0x01 {
+ 			fmt.Printf("⚠️ ESP32 拒绝写入索引 %d\n", idx)
+ 		}
+
+ 		time.Sleep(time.Second / 2) // 客户端控制 0.5 秒的上报步进
+ 	}
+ 	fmt.Println("🚀 16位队列流式覆写同步成功！")
  }
 
  func main() {
- 	// 目标虚拟串口路径
  	serialPort := "/dev/cu.usbmodem1101"
 
- 	// 功能动作：“read”或“write”
- 	action := "read"
- 	writeValue := 1 // 当 action 为 write 时的改写目标值
+ 	// ==========================================
+ 	// 模式切换控制
+ 	// ==========================================
+ 	mode := "read" // 设为 "read" 测试流式读取， 设为 "write" 测试流式写入
+ 	// ==========================================
 
- 	switch action {
- 	case "read":
- 		fmt.Printf("[Go-Serial] 正在通过 tarm/serial 读取设备 %s ...\n", serialPort)
- 		resVal, err := sendAndReceive(serialPort, 0x01, 0x00)
- 		if err != nil {
- 			log.Fatalf("❌ 操作失败: %v", err)
- 		}
- 		fmt.Printf("🎉 读取成功！当前 httpd_enble 值为: %d\n", resVal)
-
- 	case "write":
- 		fmt.Printf("[Go-Serial] 正在通过 tarm/serial 修改设备 %s 值为 %d ...\n", serialPort, writeValue)
- 		resVal, err := sendAndReceive(serialPort, 0x02, byte(writeValue))
- 		if err != nil {
- 			log.Fatalf("❌ 操作失败: %v", err)
- 		}
- 		if resVal == 0x01 {
- 			fmt.Println("🚀 成功！ESP32 已接收新参数并同步固化至其内部 NVS Flash。")
- 		} else {
- 			fmt.Println("❌ 失败：写入请求遭芯片底层拒绝。")
- 		}
+ 	if mode == "read" {
+ 		streamRead(serialPort)
+ 	} else {
+ 		streamWrite(serialPort)
  	}
  }
