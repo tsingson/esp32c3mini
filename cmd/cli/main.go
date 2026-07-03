@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	// 明确且唯一引入的第三方串口库
+	"github.com/alexflint/go-arg"
 	"github.com/tarm/serial"
 )
 
@@ -73,12 +73,25 @@ func handleInteractiveSetup(s *serial.Port) {
 	fmt.Println("🚀 搜救节点配网成功！3分钟周期性低功耗唤醒搜救循环已在 ESP32 内部启动。")
 }
 
-func main() {
-	port := flag.String("port", "/dev/cu.usbmodem1101", "串口设备节点路径")
-	action := flag.String("action", "read", "可选动作: read 或 setup")
-	flag.Parse()
+type Parameter struct {
+	Action string `arg:"-a, --action" default="read"`
+	Wifi   string `arg:"-w, --wifi" default="MUSIC"`
+	Pass   string `arg:"-p, --pass" default="22676263"`
+	Usb    string `arg:"-u, --usb" default:"/dev/cu.usbmodem1101"`
+}
 
-	config := &serial.Config{Name: *port, Baud: 115200, ReadTimeout: time.Second * 3}
+func main() {
+	var args Parameter
+	arg.MustParse(&args)
+	fmt.Println("action", args.Action)
+	fmt.Println("wifi", args.Wifi)
+	fmt.Println("pass", args.Pass)
+
+	// 	port := flag.String("port", "/dev/cu.usbmodem1101", "串口设备节点路径")
+	// 	action := flag.String("action", "read", "可选动作: read 或 setup")
+	// 	flag.Parse()
+
+	config := &serial.Config{Name: args.Usb, Baud: 115200, ReadTimeout: time.Second * 3}
 	s, err := serial.OpenPort(config)
 	if err != nil {
 		log.Fatalf("无法打开串口: %v", err)
@@ -89,7 +102,7 @@ func main() {
 	time.Sleep(time.Millisecond * 1500)
 	s.Flush()
 
-	switch *action {
+	switch args.Action {
 	case "read":
 		fmt.Println("[SAR-CLI] 正在请求读取搜救节点当前的网卡配置...")
 		txBuf := []byte{0xAA, 0xBB, CmdReadSSID, 0x00, 0x00}
