@@ -13,12 +13,12 @@
 
 static const char *TAG = "wifi_ap_admin";
 
-#ifdef ARDUINO_ESP32C3_DEV
-// 软热点配置修改
-#define ESP_WIFI_SSID      "esp32cfgc3` "
-#elif
+// #ifdef ARDUINO_ESP32C3_DEV
+// // 软热点配置修改
+// #define ESP_WIFI_SSID      "esp32cfgc3` "
+// #elif
 #define ESP_WIFI_SSID      "esp32cfg"
-#endif
+// #endif
 
 //
 #define ESP_WIFI_PASS      "12345678"
