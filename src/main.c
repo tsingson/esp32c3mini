@@ -8,6 +8,8 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "http_client.h"
+#include "network_interface.h"
 #include "nvs_flash.h"
 #include <stdio.h>
 #include <string.h>
@@ -98,54 +100,6 @@ void send_packet(uint8_t cmd, uint8_t status, uint8_t val) {
  * ------------------------------------------------------------------ */
 static bool wifi_connected = false;
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data) {
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
-  } else if (event_base == WIFI_EVENT &&
-             event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    wifi_connected = false;
-  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    wifi_connected = true;
-  }
-}
-
-// 接收传入参数，支持传入自定义配置或硬编码默认配置
-bool init_wifi_and_connect(const char *target_ssid, const char *target_pass) {
-  if (strlen(target_ssid) == 0) {
-    return false;
-  }
-
-  wifi_config_t wifi_config = {0};
-  strncpy((char *)wifi_config.sta.ssid, target_ssid,
-          sizeof(wifi_config.sta.ssid));
-  strncpy((char *)wifi_config.sta.password, target_pass,
-          sizeof(wifi_config.sta.password));
-
-  // 强行命令 Wi-Fi 驱动使用 RAM 配置，忽略并覆盖过往隐藏的乱连历史
-  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-  wifi_connected = false;
-  if (esp_wifi_start() != ESP_OK)
-    return false;
-
-  // 有限阻塞等待 10 秒
-  int retry = 0;
-  while (!wifi_connected && retry < 20) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-    retry++;
-  }
-  return wifi_connected;
-}
-
-void stop_wifi(void) {
-  esp_wifi_disconnect();
-  esp_wifi_stop();
-  wifi_connected = false;
-}
-
 esp_err_t http_event_handler(esp_http_client_event_t *evt) {
   if (evt->event_id == HTTP_EVENT_ON_DATA) {
     if (g_usb_driver_installed) {
@@ -167,66 +121,6 @@ bool fetch_httpbin(void) {
   bool success = (err == ESP_OK);
   esp_http_client_cleanup(client);
   return success;
-}
-
-/* ------------------------------------------------------------------
- * 3. 搜救主业务任务循环 (支持异常自动降级自愈)
- * ------------------------------------------------------------------ */
-void sar_mission_task(void *pvParameters) {
-  ESP_ERROR_CHECK(esp_netif_init());
-  esp_netif_create_default_wifi_sta();
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-  ESP_ERROR_CHECK(esp_event_handler_instance_register(
-      WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-  ESP_ERROR_CHECK(esp_event_handler_instance_register(
-      IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
-
-  while (1) {
-    int retry_count = 0;
-    bool bidi_transmission_success = false;
-
-    // 🚀 尝试 1：优先采用 Flash 存储的用户网络账密进行连接上报
-    if (init_wifi_and_connect(wifi_ssid, wifi_pass)) {
-      while (retry_count < 3) {
-        if (fetch_httpbin()) {
-          bidi_transmission_success = true;
-          break;
-        }
-        retry_count++;
-        vTaskDelay(pdMS_TO_TICKS(2000));
-      }
-      stop_wifi();
-    }
-
-    // 🚀 尝试 2（🎯 降级核心）：如果上面因为连接超时或访问 httpbin 失败 3 次
-    if (!bidi_transmission_success) {
-      if (g_usb_driver_installed) {
-        printf("\n⚠️ [自愈警告] 用户配置连接失败，强制降级使用默认安全网络线路: "
-               "%s ...\n",
-               DEFAULT_WIFI_SSID);
-      }
-
-      // 强制启用硬编码后备账密进行兜底连接
-      if (init_wifi_and_connect(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS)) {
-        retry_count = 0;
-        while (retry_count < 3) {
-          if (fetch_httpbin()) {
-            break;
-          }
-          retry_count++;
-          vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-        stop_wifi();
-      }
-    }
-
-    // 完成本周期上报后，纯软件挂起 3 分钟进行下一次轮询
-    vTaskDelay(pdMS_TO_TICKS(3 * 60 * 1000));
-  }
 }
 
 /* ------------------------------------------------------------------
@@ -294,6 +188,45 @@ void usb_rx_task(void *pvParameters) {
     }
   }
 }
+
+/////////
+
+extern const network_driver_t wifi_driver; // 引用外部驱动
+
+void sar_mission_task(void *pvParameters) {
+  // 统一初始化
+  wifi_driver.init();
+
+  while (1) {
+    // 使用驱动进行业务逻辑
+    bool success = false;
+
+    // 尝试主配置
+    // if (wifi_driver.connect(wifi_ssid, wifi_pass)) {
+    //   success = fetch_httpbin(); // fetch 函数保持在 main 中或移至单独的
+    //   http.c wifi_driver.disconnect();
+    // }
+    if (wifi_driver.connect(wifi_ssid, wifi_pass)) {
+      // 调用我们刚写的 TCP 版本
+      fetch_httpbin_via_tcp();
+      wifi_driver.disconnect();
+    }
+
+    // 尝试后备配置
+    if (!success) {
+      if (wifi_driver.connect(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS)) {
+        fetch_httpbin();
+        wifi_driver.disconnect();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(3 * 60 * 1000));
+  }
+}
+//
+// void app_main(void) {
+//   // ... 初始化 NVS, USB 等 ...
+//   xTaskCreate(sar_mission_task, "sar_mission", 5120, NULL, 5, NULL);
+// }
 
 void app_main(void) {
   vTaskDelay(pdMS_TO_TICKS(1000));
