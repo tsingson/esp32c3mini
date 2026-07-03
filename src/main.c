@@ -283,7 +283,9 @@ void sar_mission_task(void *pvParameters) {
 
 void app_main(void) {
 
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  // 刚开机先死等 3 秒，给电脑和 PlatformIO 留出重新连接和抓取串口的缓冲时间
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  //
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
   init_and_load_nvs_config();
