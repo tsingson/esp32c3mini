@@ -13,8 +13,14 @@
 
 static const char *TAG = "wifi_ap_admin";
 
+#ifdef ARDUINO_ESP32C3_DEV
 // 软热点配置修改
+#define ESP_WIFI_SSID      "esp32cfgc3` "
+#elif
 #define ESP_WIFI_SSID      "esp32cfg"
+#endif
+
+//
 #define ESP_WIFI_PASS      "12345678"
 #define ESP_WIFI_CHANNEL   1
 #define MAX_STA_CONN       4
@@ -210,6 +216,13 @@ void wifi_init_softap(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // 必须在 esp_wifi_start() 成功之后调用
+    // WIFI_POWER_8_5dBm 对应 34 (单位是 0.25dBm，即 34 * 0.25 = 8.5)
+    esp_wifi_set_max_tx_power(34);
+    ESP_LOGI(TAG, "已强制将 Wi-Fi 发射功率限制为 8.5dBm 规避硬件干扰");
+
+
 
     ESP_LOGI(TAG, "Wi-Fi AP 已成功就绪。SSID: esp32cfg 密码: %s", ESP_WIFI_PASS);
 }
