@@ -35,7 +35,16 @@ bool fetch_httpbin_via_tcp(void) {
                     "Host: httpbin.org\r\n"
                     "Accept: application/json\r\n"
                     "Connection: close\r\n\r\n";
-  write(sock, req, strlen(req));
+  size_t req_len = strlen(req);
+  size_t sent = 0;
+  while (sent < req_len) {
+    int ret = write(sock, req + sent, req_len - sent);
+    if (ret <= 0) {
+      close(sock);
+      return false;
+    }
+    sent += (size_t)ret;
+  }
 
   // char json_body[] = "{\"key\":\"value\"}";
   // char req[512];
