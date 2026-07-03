@@ -55,19 +55,25 @@ import (
  	return rxBuf, nil
  }
 
- // 流式读取模式
+
+
  func streamRead(portName string) {
- 	config := &serial.Config{Name: portName, Baud: 115200, ReadTimeout: time.Second * 2}
+ 	// ⏳ ReadTimeout 增加到 5 秒，防止 3 秒间隔时引发超时误判
+ 	config := &serial.Config{Name: portName, Baud: 115200, ReadTimeout: time.Second * 5}
  	s, err := serial.OpenPort(config)
  	if err != nil {
  		log.Fatalf("无法打开串口: %v", err)
  	}
  	defer s.Close()
 
- 	time.Sleep(time.Millisecond * 1000)
- 	fmt.Println("[Go-Client] 发送流式读取激活指令...")
+ 	// 打开串口后，先睡眠 2.5 秒，彻底震荡掉拔插和打开串口时驱动产生的垃圾字符
+ 	fmt.Println("[Go-Client] 正在等待串口总线稳定...")
+ 	time.Sleep(time.Millisecond * 2500)
 
- 	// 发送激活包: cmd=0x03, 后两字节填 0 即可
+ 	// 强行清空可能残留的开机杂散数据
+ 	s.Flush()
+
+ 	fmt.Println("[Go-Client] 发送流式读取激活指令...")
  	txBuf := []byte{0xAA, 0xBB, 0x03, 0x00, 0x00}
  	var sum byte
  	for i := 0; i < 4; i++ { sum += txBuf[i] }
@@ -76,7 +82,6 @@ import (
 
  	fmt.Println("[Go-Client] 进入 Streaming 接收状态，等待数据喷吐...")
 
- 	// 循环 16 次，每次严格等待接收 ESP32 每隔 0.5 秒发来的一包
  	for i := 0; i < 16; i++ {
  		rxBuf := make([]byte, 5)
  		_, err := io.ReadFull(s, rxBuf)
@@ -86,10 +91,12 @@ import (
 
  		idx := rxBuf[3]
  		val := rxBuf[4]
- 		fmt.Printf("⏱️ [0.5s 步进] 收到队列数据 -> 索引位置 [%02d]: 数值 = %d\n", idx, val)
+ 		// 打印当前时间，以便肉眼观察是不是精准的 3 秒打印一次
+ 		fmt.Printf("[%s] ⏱️ [3.0s 步进] 收到队列数据 -> 索引位置 [%02d]: 数值 = %d\n", time.Now().Format("15:04:05"), idx, val)
  	}
  	fmt.Println("🎉 16位队列流式读取完整结束！")
  }
+
 
  // 流式写入模式
  func streamWrite(portName string) {
