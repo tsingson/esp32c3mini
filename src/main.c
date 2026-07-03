@@ -9,40 +9,17 @@
 #define QUEUE_SIZE 16
 #define BUF_SIZE   1024
 
+// 流控命令及状态机定义
+#define STREAM_DATA   0x00
+#define STREAM_EOF    0x01
+#define STREAM_CANCEL 0x02
+
 uint8_t httpd_enable = 0;
-uint8_t stream_queue[QUEUE_SIZE] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+uint8_t stream_queue[QUEUE_SIZE] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160};
 
-void init_and_load_nvs_config(void) {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
+// 用于管理流式喷吐任务的 FreeRTOS 句柄
+static TaskHandle_t stream_tx_task_handle = NULL;
 
-    nvs_handle_t my_handle;
-    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
-        err = nvs_get_u8(my_handle, "httpd_enble", &httpd_enable);
-        if (err == ESP_ERR_NVS_NOT_FOUND) {
-            httpd_enable = 0;
-            nvs_set_u8(my_handle, "httpd_enble", httpd_enable);
-            nvs_commit(my_handle);
-        }
-        nvs_close(my_handle);
-    }
-}
-
-void save_nvs_config(uint8_t val) {
-    nvs_handle_t my_handle;
-    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
-        nvs_set_u8(my_handle, "httpd_enble", val);
-        nvs_commit(my_handle);
-        nvs_close(my_handle);
-        httpd_enable = val;
-    }
-}
-
-// 严谨的二进制包打包函数
 void send_binary_packet(uint8_t cmd, uint8_t index_or_status, uint8_t val) {
     uint8_t tx_buf[5];
     tx_buf[0] = 0xAA;
@@ -52,28 +29,40 @@ void send_binary_packet(uint8_t cmd, uint8_t index_or_status, uint8_t val) {
     tx_buf[4] = val;
 
     uint8_t sum = 0;
-    for(int i = 0; i < 4; i++) {
-        sum += tx_buf[i];
-    }
-    tx_buf[4] = sum; // 覆盖第5字节为精确校验和
+    for(int i = 0; i < 4; i++) sum += tx_buf[i];
+    tx_buf[4] = sum;
 
     fwrite(tx_buf, 1, 5, stdout);
     fflush(stdout);
 }
 
-// 【修订】：将流式喷吐的间隔强制延长至 3 秒
-void handle_streaming_output(void) {
+// 独立的流喷吐服务子线程
+void stream_tx_task(void *pvParameters) {
     for (int i = 0; i < QUEUE_SIZE; i++) {
-        send_binary_packet(0x03, (uint8_t)i, stream_queue[i]);
-        vTaskDelay(pdMS_TO_TICKS(3000)); // ⏳ 严格每隔 3 秒喷发一包
+        send_binary_packet(0x03, STREAM_DATA, stream_queue[i]);
+
+        // 将 3 秒的长延时拆解为 30 次 100ms 的短切片，从而能够毫秒级响应外部的中止退出事件
+        for (int t = 0; t < 30; t++) {
+            uint32_t notify_val;
+            // 非阻塞检查是否有外部（主串口任务）下发的杀进程信号
+            if (xTaskNotifyWait(0, 0, &notify_val, pdMS_TO_TICKS(100)) == pdTRUE) {
+                // 收到强行终止指令，发送中止确认帧后优雅自毁
+                send_binary_packet(0x03, STREAM_CANCEL, 0xFF);
+                stream_tx_task_handle = NULL;
+                vTaskDelete(NULL);
+                return;
+            }
+        }
     }
+
+    // 16位数据顺利吐完，向 Go 发送明确的 Close 信号
+    send_binary_packet(0x03, STREAM_EOF, 0x00);
+    stream_tx_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 void usb_rx_task(void *pvParameters) {
-    usb_serial_jtag_driver_config_t usb_config = {
-        .rx_buffer_size = 512,
-        .tx_buffer_size = 512
-    };
+    usb_serial_jtag_driver_config_t usb_config = { .rx_buffer_size = 512, .tx_buffer_size = 512 };
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_config));
     esp_vfs_usb_serial_jtag_use_driver();
 
@@ -88,7 +77,6 @@ void usb_rx_task(void *pvParameters) {
             if (packet_idx >= BUF_SIZE) packet_idx = 0;
             data_buf[packet_idx++] = ch;
 
-            // 状态机强行对齐帧头 [0xAA 0xBB]
             if (packet_idx == 1 && data_buf[0] != 0xAA) { packet_idx = 0; continue; }
             if (packet_idx == 2 && data_buf[1] != 0xBB) { packet_idx = 0; continue; }
 
@@ -104,23 +92,18 @@ void usb_rx_task(void *pvParameters) {
                     if (cmd == 0x01) {
                         send_binary_packet(0x01, 0x00, httpd_enable);
                     }
-                    else if (cmd == 0x02) {
-                        if (status_or_idx == 0 || status_or_idx == 1) {
-                            save_nvs_config(status_or_idx);
-                            send_binary_packet(0x02, 0x01, 0x01);
-                        } else {
-                            send_binary_packet(0x02, 0x00, 0x00);
-                        }
-                    }
                     else if (cmd == 0x03) {
-                        handle_streaming_output(); // 进入 3 秒步进流式发送
-                    }
-                    else if (cmd == 0x04) {
-                        if (status_or_idx < QUEUE_SIZE) {
-                            stream_queue[status_or_idx] = val;
-                            send_binary_packet(0x04, status_or_idx, 0x01);
-                        } else {
-                            send_binary_packet(0x04, status_or_idx, 0x00);
+                        if (status_or_idx == STREAM_DATA) {
+                            // 启动流：防止重复拉起多个任务实例
+                            if (stream_tx_task_handle == NULL) {
+                                xTaskCreate(stream_tx_task, "stream_tx", 3072, NULL, 5, &stream_tx_task_handle);
+                            }
+                        }
+                        else if (status_or_idx == STREAM_CANCEL) {
+                            // 🚀【核心中止动作】：如果流正在运行，直接通过任务通知强行唤醒并终止它
+                            if (stream_tx_task_handle != NULL) {
+                                xTaskNotifyGive(stream_tx_task_handle);
+                            }
                         }
                     }
                 }
@@ -133,8 +116,6 @@ void usb_rx_task(void *pvParameters) {
 }
 
 void app_main(void) {
-    // 上电死等 2 秒，让开发板和 PC 彻底完成 USB 初始化，错开所有硬件电涌
     vTaskDelay(pdMS_TO_TICKS(2000));
-    init_and_load_nvs_config();
     xTaskCreate(usb_rx_task, "usb_rx_task", 4096, NULL, 10, NULL);
 }
