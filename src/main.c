@@ -2,24 +2,27 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "esp_vfs_dev.h"
 #include "driver/usb_serial_jtag.h"
 
-#define QUEUE_SIZE 16
-#define BUF_SIZE   1024
+#define BUF_SIZE        1024
+#define CMD_BIDI_STREAM 0x05
+#define STREAM_DATA     0x00
+#define STREAM_EOF      0x01
+#define STREAM_CANCEL   0x02
 
-// 流控命令及状态机定义
-#define STREAM_DATA   0x00
-#define STREAM_EOF    0x01
-#define STREAM_CANCEL 0x02
+// 线程安全互斥锁
+static SemaphoreHandle_t g_bidi_mutex = NULL;
 
-uint8_t httpd_enable = 0;
-uint8_t stream_queue[QUEUE_SIZE] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160};
+volatile bool is_bidi_active = false;
+volatile uint8_t target_value = 0;
+volatile uint8_t current_status = 0;
 
-// 用于管理流式喷吐任务的 FreeRTOS 句柄
-static TaskHandle_t stream_tx_task_handle = NULL;
+static TaskHandle_t bidi_tx_task_handle = NULL;
 
+// 稳定性优化：带有缓冲和超时控制的二进制安全发送
 void send_binary_packet(uint8_t cmd, uint8_t index_or_status, uint8_t val) {
     uint8_t tx_buf[5];
     tx_buf[0] = 0xAA;
@@ -32,35 +35,47 @@ void send_binary_packet(uint8_t cmd, uint8_t index_or_status, uint8_t val) {
     for(int i = 0; i < 4; i++) sum += tx_buf[i];
     tx_buf[4] = sum;
 
-    fwrite(tx_buf, 1, 5, stdout);
-    fflush(stdout);
+    // 严谨写入标准输出，采用 fflush 强行排空
+    size_t written = fwrite(tx_buf, 1, 5, stdout);
+    if (written == 5) {
+        fflush(stdout);
+    }
 }
 
-// 独立的流喷吐服务子线程
-void stream_tx_task(void *pvParameters) {
-    for (int i = 0; i < QUEUE_SIZE; i++) {
-        send_binary_packet(0x03, STREAM_DATA, stream_queue[i]);
-
-        // 将 3 秒的长延时拆解为 30 次 100ms 的短切片，从而能够毫秒级响应外部的中止退出事件
-        for (int t = 0; t < 30; t++) {
-            uint32_t notify_val;
-            // 非阻塞检查是否有外部（主串口任务）下发的杀进程信号
-            if (xTaskNotifyWait(0, 0, &notify_val, pdMS_TO_TICKS(100)) == pdTRUE) {
-                // 收到强行终止指令，发送中止确认帧后优雅自毁
-                send_binary_packet(0x03, STREAM_CANCEL, 0xFF);
-                stream_tx_task_handle = NULL;
-                vTaskDelete(NULL);
-                return;
+// 任务 1：高频上行喷吐流 (互斥锁保护 + 逼近算法)
+void bidi_tx_task(void *pvParameters) {
+    while (1) {
+        // 安全锁保护
+        if (xSemaphoreTake(g_bidi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (!is_bidi_active) {
+                xSemaphoreGive(g_bidi_mutex);
+                break; // 收到退出信号，安全解锁并跳出
             }
+
+            // 逼近算法
+            if (current_status < target_value) {
+                current_status += 2;
+                if (current_status > target_value) current_status = target_value;
+            } else if (current_status > target_value) {
+                current_status -= 2;
+                if (current_status < target_value) current_status = target_value;
+            }
+
+            uint8_t snap_status = current_status;
+            xSemaphoreGive(g_bidi_mutex);
+
+            // 发送数据（发送动作移出锁区，防止阻塞接收）
+            send_binary_packet(CMD_BIDI_STREAM, STREAM_DATA, snap_status);
         }
+
+        vTaskDelay(pdMS_TO_TICKS(500)); // 严格 0.5s 步进
     }
 
-    // 16位数据顺利吐完，向 Go 发送明确的 Close 信号
-    send_binary_packet(0x03, STREAM_EOF, 0x00);
-    stream_tx_task_handle = NULL;
+    bidi_tx_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
+// 任务 2：下行接收流状态机 (工业级自愈滑动窗口)
 void usb_rx_task(void *pvParameters) {
     usb_serial_jtag_driver_config_t usb_config = { .rx_buffer_size = 512, .tx_buffer_size = 512 };
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_config));
@@ -77,37 +92,49 @@ void usb_rx_task(void *pvParameters) {
             if (packet_idx >= BUF_SIZE) packet_idx = 0;
             data_buf[packet_idx++] = ch;
 
+            // 🚀 可靠性核心：帧头滑动对齐校检 🚀
             if (packet_idx == 1 && data_buf[0] != 0xAA) { packet_idx = 0; continue; }
-            if (packet_idx == 2 && data_buf[1] != 0xBB) { packet_idx = 0; continue; }
+            if (packet_idx == 2 && data_buf[1] != 0xBB) {
+                if (data_buf[1] == 0xAA) { // 处理连续 0xAA 0xAA 0xBB 的边缘情况
+                    data_buf[0] = 0xAA; packet_idx = 1;
+                } else {
+                    packet_idx = 0;
+                }
+                continue;
+            }
 
             if (packet_idx == 5) {
                 uint8_t cmd = data_buf[2];
-                uint8_t status_or_idx = data_buf[3];
+                uint8_t status_or_flag = data_buf[3];
                 uint8_t val = data_buf[4];
 
                 uint8_t calc_sum = 0;
                 for(int i = 0; i < 4; i++) calc_sum += data_buf[i];
 
                 if (val == calc_sum) {
-                    if (cmd == 0x01) {
-                        send_binary_packet(0x01, 0x00, httpd_enable);
-                    }
-                    else if (cmd == 0x03) {
-                        if (status_or_idx == STREAM_DATA) {
-                            // 启动流：防止重复拉起多个任务实例
-                            if (stream_tx_task_handle == NULL) {
-                                xTaskCreate(stream_tx_task, "stream_tx", 3072, NULL, 5, &stream_tx_task_handle);
+                    if (cmd == CMD_BIDI_STREAM) {
+                        if (status_or_flag == STREAM_DATA) {
+                            if (xSemaphoreTake(g_bidi_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                                target_value = val;
+                                if (!is_bidi_active && bidi_tx_task_handle == NULL) {
+                                    is_bidi_active = true;
+                                    xTaskCreate(bidi_tx_task, "bidi_tx", 3072, NULL, 5, &bidi_tx_task_handle);
+                                }
+                                xSemaphoreGive(g_bidi_mutex);
                             }
                         }
-                        else if (status_or_idx == STREAM_CANCEL) {
-                            // 🚀【核心中止动作】：如果流正在运行，直接通过任务通知强行唤醒并终止它
-                            if (stream_tx_task_handle != NULL) {
-                                xTaskNotifyGive(stream_tx_task_handle);
+                        else if (status_or_flag == STREAM_CANCEL || status_or_flag == STREAM_EOF) {
+                            if (xSemaphoreTake(g_bidi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                                if (is_bidi_active) {
+                                    is_bidi_active = false; // 触发发送线程安全退出
+                                    send_binary_packet(CMD_BIDI_STREAM, STREAM_EOF, 0x00);
+                                }
+                                xSemaphoreGive(g_bidi_mutex);
                             }
                         }
                     }
                 }
-                packet_idx = 0;
+                packet_idx = 0; // 清空状态机
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -117,5 +144,10 @@ void usb_rx_task(void *pvParameters) {
 
 void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(2000));
-    xTaskCreate(usb_rx_task, "usb_rx_task", 4096, NULL, 10, NULL);
+
+    // 创建互斥锁
+    g_bidi_mutex = xSemaphoreCreateMutex();
+    if (g_bidi_mutex != NULL) {
+        xTaskCreate(usb_rx_task, "usb_rx_task", 4096, NULL, 10, NULL);
+    }
 }

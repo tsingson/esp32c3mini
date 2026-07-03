@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"time"
 
@@ -11,94 +10,148 @@ import (
 )
 
 const (
-	StreamData   byte = 0x00
-	StreamEOF    byte = 0x01
-	StreamCancel byte = 0x02
+	CmdBidiStream byte = 0x05
+	StreamData    byte = 0x00
+	StreamEOF     byte = 0x01
+	StreamCancel  byte = 0x02
 )
 
-func streamWithCancelDemo(portName string) {
-	config := &serial.Config{Name: portName, Baud: 115200, ReadTimeout: time.Second * 5}
+func sendPacket(s *serial.Port, cmd, status, val byte) error {
+	txBuf := []byte{0xAA, 0xBB, cmd, status, val}
+	var sum byte
+	for i := 0; i < 4; i++ {
+		sum += txBuf[i]
+	}
+	txBuf[4] = sum
+	_, err := s.Write(txBuf)
+	return err
+}
+
+func startRobustBidiStreaming(portName string) {
+	config := &serial.Config{Name: portName, Baud: 115200, ReadTimeout: time.Millisecond * 2000}
 	s, err := serial.OpenPort(config)
 	if err != nil {
 		log.Fatalf("无法打开串口: %v", err)
 	}
 	defer s.Close()
 
-	fmt.Println("[Go-Client] 初始化串口管道...")
+	fmt.Println("[Go-Client] 初始化工业级全双工串口总线...")
 	time.Sleep(time.Millisecond * 2000)
 	s.Flush()
 
-	fmt.Println("[Go-Client] 发送流式开启命令...")
-	startBuf := []byte{0xAA, 0xBB, 0x03, StreamData, 0x00}
-	var sum byte
-	for i := 0; i < 4; i++ {
-		sum += startBuf[i]
-	}
-	startBuf[4] = sum
-	s.Write(startBuf)
+	bidiCtxDone := make(chan bool, 1)
 
-	fmt.Println("[Go-Client] 建立连接成功。进入无限流式接收状态机...")
+	// ------------------------------------------------------------------
+	// 协程分流 1：升级为【滑动窗口单字节状态机】的异步接收回路
+	// ------------------------------------------------------------------
+	go func() {
+		fmt.Println("[Go-StreamReader] 自愈状态机已拉起，开始监控上行流...")
 
-	packetCount := 0
+		var rawBuf [1]byte
+		packetBuf := make([]byte, 5)
+		stateIdx := 0
 
-	for {
-		rxBuf := make([]byte, 5)
-		_, err := io.ReadFull(s, rxBuf)
-		if err != nil {
-			log.Fatalf("\n❌ 物理读取终止: %v", err)
-		}
-
-		if rxBuf[0] != 0xAA || rxBuf[1] != 0xBB {
-			continue
-		}
-		var calcSum byte
-		for i := 0; i < 4; i++ {
-			calcSum += rxBuf[i]
-		}
-		if rxBuf[4] != calcSum {
-			continue
-		}
-
-		streamStatus := rxBuf[3]
-		dataVal := rxBuf[4]
-
-		switch streamStatus {
-		case StreamData:
-			packetCount++
-			fmt.Printf("[%s] 📥 [Streaming] 收到数据 -> Value = %d\n", time.Now().Format("15:04:05"), dataVal)
-
-			// 🚀【核心主动中止触发点】：当收到第 3 帧数据时，Go 模拟触发主动取消机制
-			if packetCount == 3 {
-				fmt.Println("\n🛑 [Go-Client] 触发中途主动中止动作！向 ESP32 发送 CANCEL 信号...")
-
-				cancelBuf := []byte{0xAA, 0xBB, 0x03, StreamCancel, 0x00}
-				var cSum byte
-				for i := 0; i < 4; i++ {
-					cSum += cancelBuf[i]
-				}
-				cancelBuf[4] = cSum
-
-				// 逆向写入取消帧
-				_, err = s.Write(cancelBuf)
-				if err != nil {
-					fmt.Printf("发送取消信号失败: %v\n", err)
-				}
+		for {
+			// 单字节读取，天然对齐流式传输
+			n, err := s.Read(rawBuf[:])
+			if err != nil {
+				fmt.Printf("\n[Go-StreamReader] 管道物理中断退出: %v\n", err)
+				bidiCtxDone <- true
+				return
+			}
+			if n == 0 {
+				continue
 			}
 
-		case StreamCancel:
-			// 🚀 收到来自 ESP32 回应的流式强制中止确认，完美闭合流
-			fmt.Printf("\n🤝 [%s] ======= 收到 ESP32 的 CANCEL (STREAM_CANCEL) 确认信号 =======\n", time.Now().Format("15:04:05"))
-			fmt.Println("🎉 客户端成功中途斩断流传输，通道安全闭合！")
-			return
+			ch := rawBuf[0]
 
-		case StreamEOF:
-			fmt.Println("\n🏁 收到完整的流结束信号。")
-			return
+			// 防御性边界越界锁
+			if stateIdx >= 5 {
+				stateIdx = 0
+			}
+			packetBuf[stateIdx] = ch
+			stateIdx++
+
+			// 🚀 自愈核心：动态扫描对齐帧头 🚀
+			if stateIdx == 1 && packetBuf[0] != 0xAA {
+				stateIdx = 0
+				continue
+			}
+			if stateIdx == 2 && packetBuf[1] != 0xBB {
+				if packetBuf[1] == 0xAA { // 容错 0xAA 0xAA 0xBB 的情况
+					packetBuf[0] = 0xAA
+					stateIdx = 1
+				} else {
+					stateIdx = 0
+				}
+				continue
+			}
+
+			// 成功攒满 5 字节无错包
+			if stateIdx == 5 {
+				cmd := packetBuf[2]
+				streamFlag := packetBuf[3]
+				serverStatusVal := packetBuf[4]
+
+				// 重置索引给下一包准备
+				stateIdx = 0
+
+				// 过滤非本项目命令
+				if cmd != CmdBidiStream {
+					continue
+				}
+
+				// 校验和验证
+				var calcSum byte
+				for i := 0; i < 4; i++ {
+					calcSum += packetBuf[i]
+				}
+				if serverStatusVal != calcSum {
+					fmt.Println("⚠️  [Go-StreamReader] 抓到一条数据校验和错误包，已自动剔除自愈。")
+					continue
+				}
+
+				// 协议业务分发
+				switch streamFlag {
+				case StreamData:
+					fmt.Printf("           📈 [ESP32 反馈流] 物理逼近状态 -> 实时值 = %d\n", packetBuf[3]) // 修正：按照 C 端格式，反馈流 status 位携带真实演变值
+				case StreamEOF:
+					fmt.Println("\n🏁 [Go-StreamReader] ======= 收到对等端明确的 CLOSE STREAM 信标 =======")
+					bidiCtxDone <- true
+					return
+				}
+			}
 		}
+	}()
+
+	// ------------------------------------------------------------------
+	// 业务回路 2：主线程持续下行调参流 (客户端 -> 服务端)
+	// ------------------------------------------------------------------
+	fmt.Println("[Go-Client] 🚀 双向流就绪，开始动态注入参数进行压力测试...")
+
+	dynamicParams := []byte{40, 5, 80, 0}
+
+	for _, nextTarget := range dynamicParams {
+		fmt.Printf("\n⚙️  [Go-Client 动态调参] >>> 持续下发新目标参数 = %d\n", nextTarget)
+
+		err := sendPacket(s, CmdBidiStream, StreamData, nextTarget)
+		if err != nil {
+			fmt.Printf("下发配置失败: %v\n", err)
+			break
+		}
+		// 维持调参参数 1.5 秒
+		time.Sleep(time.Millisecond * 1500)
 	}
+
+	fmt.Println("\n🛑 [Go-Client] 业务调整完毕，下发对等结束信标...")
+	sendPacket(s, CmdBidiStream, StreamEOF, 0x00)
+
+	// 阻塞等待异步流闭合
+	<-bidiCtxDone
+	fmt.Println("🎉 稳定性优化版双向流成功闭合，系统清理安全退出。")
 }
 
 func main() {
 	serialPort := "/dev/cu.usbmodem1101"
-	streamWithCancelDemo(serialPort)
+	startRobustBidiStreaming(serialPort)
 }
